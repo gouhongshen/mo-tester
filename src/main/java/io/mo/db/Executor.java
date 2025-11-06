@@ -14,9 +14,15 @@ import io.mo.util.ResultParser;
 import org.apache.log4j.Logger;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.*;
 import java.sql.Connection;
 import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 
 public class Executor {
 
@@ -133,53 +139,57 @@ public class Executor {
             
 
             try {
-                //connection.getCatalog();
-                //connection.setCatalog(command.getUseDB());
                 command.setUseDB(connection.getCatalog());
-                statement = connection.createStatement();
                 String sqlCmd = command.getCommand()
                         .replaceAll(COMMON.RESOURCE_LOCAL_PATH_FLAG,COMMON.RESOURCE_LOCAL_PATH)
                         .replaceAll(COMMON.RESOURCE_PATH_FLAG,COMMON.RESOURCE_PATH);
-                if(command.isNeedWait()){
-                    execWaitOperation(command);
-                }
-                statement.execute(sqlCmd);
-                if(command.isNeedWait()){
-                    Thread.sleep(COMMON.WAIT_TIMEOUT/10);
-                    if(waitThread != null && waitThread.isAlive()){
-                        try {
-                            LOG.error(String.format("Command[%s][row:%d] has been executed before connection[id=%d] commit.\nBut still need to wait for connection[id=%d] being committed",
-                                    command.getCommand(),command.getPosition(),command.getWaitConnId(),command.getWaitConnId()));
-                            waitThread.join();
-                            script.addFailedCmd(command);
-                            command.getTestResult().setErrorCode(RESULT.ERROR_CHECK_FAILED_CODE);
-                            command.getTestResult().setErrorDesc(RESULT.ERROR_CHECK_FAILED_DESC);
-                            command.getTestResult().setResult(RESULT.RESULT_TYPE_FAILED);
-                            LOG.error("[" + script.getFileName() + "][row:" + command.getPosition() + "][" + command.getCommand().trim() + "] was executed failed, con[id="
-                                    + command.getConn_id()+", user=" +command.getConn_user()+", pwd="+command.getConn_pswd()+"].");
-                            continue;
-                        } catch (InterruptedException e) {
-                            e.printStackTrace();
+
+                boolean handledSource = handleSourceCommand(connection, command, sqlCmd);
+                ResultSet resultSet = null;
+
+                if(!handledSource){
+                    statement = connection.createStatement();
+                    if(command.isNeedWait()){
+                        execWaitOperation(command);
+                    }
+                    statement.execute(sqlCmd);
+                    if(command.isNeedWait()){
+                        Thread.sleep(COMMON.WAIT_TIMEOUT/10);
+                        if(waitThread != null && waitThread.isAlive()){
+                            try {
+                                LOG.error(String.format("Command[%s][row:%d] has been executed before connection[id=%d] commit.\nBut still need to wait for connection[id=%d] being committed",
+                                        command.getCommand(),command.getPosition(),command.getWaitConnId(),command.getWaitConnId()));
+                                waitThread.join();
+                                script.addFailedCmd(command);
+                                command.getTestResult().setErrorCode(RESULT.ERROR_CHECK_FAILED_CODE);
+                                command.getTestResult().setErrorDesc(RESULT.ERROR_CHECK_FAILED_DESC);
+                                command.getTestResult().setResult(RESULT.RESULT_TYPE_FAILED);
+                                LOG.error("[" + script.getFileName() + "][row:" + command.getPosition() + "][" + command.getCommand().trim() + "] was executed failed, con[id="
+                                        + command.getConn_id()+", user=" +command.getConn_user()+", pwd="+command.getConn_pswd()+"].");
+                                continue;
+                            } catch (InterruptedException e) {
+                                e.printStackTrace();
+                            }
                         }
                     }
-                }
-                ResultSet resultSet = statement.getResultSet();
-                if (resultSet != null) {
-                    RSSet rsSet = new RSSet(resultSet,command);
-                    StmtResult actResult = new StmtResult(rsSet);
-                    command.setActResult(actResult);
-                    command.getTestResult().setActResult(actResult.toString());
+                    resultSet = statement.getResultSet();
+                    if (resultSet != null) {
+                        RSSet rsSet = new RSSet(resultSet,command);
+                        StmtResult actResult = new StmtResult(rsSet);
+                        command.setActResult(actResult);
+                        command.getTestResult().setActResult(actResult.toString());
 
-                    StmtResult expResult = command.getExpResult();
-                    expResult.setCommand(command);
-                    expResult.setType(RESULT.STMT_RESULT_TYPE_SET);
-                    expResult.setRsSet(ResultParser.convertToRSSet(expResult.getOrginalRSText(), command.getSeparator()));
-                    command.getTestResult().setExpResult(expResult.toString());
-                    
-                } else {
-                    StmtResult actResult = new StmtResult();
-                    actResult.setType(RESULT.STMT_RESULT_TYPE_NONE);
-                    command.setActResult(actResult);
+                        StmtResult expResult = command.getExpResult();
+                        expResult.setCommand(command);
+                        expResult.setType(RESULT.STMT_RESULT_TYPE_SET);
+                        expResult.setRsSet(ResultParser.convertToRSSet(expResult.getOrginalRSText(), command.getSeparator()));
+                        command.getTestResult().setExpResult(expResult.toString());
+
+                    } else {
+                        StmtResult actResult = new StmtResult();
+                        actResult.setType(RESULT.STMT_RESULT_TYPE_NONE);
+                        command.setActResult(actResult);
+                    }
                 }
 
                 //check whether the execution result is successful
@@ -201,7 +211,8 @@ public class Executor {
                     LOG.error("[EXPECT RESULT]:\n" + command.getTestResult().getExpResult());
                     LOG.error("[ACTUAL RESULT]:\n" + command.getTestResult().getActResult());
                 }
-                statement.close();
+                closeStatementQuietly(statement);
+                statement = null;
             } catch (SQLException e) {
                 try {
                     
@@ -240,6 +251,8 @@ public class Executor {
                             connection.setCatalog(command.getUseDB());
                             syncCommit();
                         }
+                        closeStatementQuietly(statement);
+                        statement = null;
                         continue;
                     }
 
@@ -271,13 +284,16 @@ public class Executor {
                         LOG.error("[EXPECT RESULT]:\n" + command.getTestResult().getExpResult());
                         LOG.error("[ACTUAL RESULT]:\n" + command.getTestResult().getActResult());
                     }
-
-                    assert statement != null;
-                    statement.close();
+                    closeStatementQuietly(statement);
+                    statement = null;
                 } catch (SQLException ex) {
+                    closeStatementQuietly(statement);
+                    statement = null;
                     throw new RuntimeException(ex);
                 }
             } catch (InterruptedException e) {
+                closeStatementQuietly(statement);
+                statement = null;
                 throw new RuntimeException(e);
             }
         }
@@ -302,7 +318,7 @@ public class Executor {
         Connection connection = ConnectionManager.getConnection();
 
         boolean isUpdate = false;
-        Statement statement;
+        Statement statement = null;
         BufferedWriter rs_writer;
         //check whether the result file exists
         File rsf = new File(script.getFileName().replaceAll("\\.[A-Za-z]+",COMMON.R_FILE_SUFFIX));
@@ -379,35 +395,43 @@ public class Executor {
                             rs_writer.newLine();
                         continue;
                     }
-                    
                     connection = getConnection(command);
-                    statement = connection.createStatement();
+                    statement = null;
 
-                    String sqlCmd = command.getCommand().replaceAll("\\$resources",COMMON.RESOURCE_PATH);
-                    if(command.isNeedWait()){
-                        execWaitOperation(command);
-                    }
-                    statement.execute(sqlCmd);
-                    if(command.isNeedWait()){
-                        Thread.sleep(COMMON.WAIT_TIMEOUT/10);
-                        if(waitThread != null && waitThread.isAlive()){
-                            try {
-                                LOG.error(String.format("Command[%s][row:%d] has been executed before connection[id=%d] commit.\nBut still need to wait for connection[id=%d] being committed",
-                                        command.getCommand(),command.getPosition(),command.getWaitConnId(),command.getWaitConnId()));
-                                waitThread.join();
-                                script.addFailedCmd(command);
-                                command.getTestResult().setErrorCode(RESULT.ERROR_CHECK_FAILED_CODE);
-                                command.getTestResult().setErrorDesc(RESULT.ERROR_CHECK_FAILED_DESC);
-                                command.getTestResult().setResult(RESULT.RESULT_TYPE_FAILED);
-                                LOG.error("[" + script.getFileName() + "][row:" + command.getPosition() + "][" + command.getCommand().trim() + "] was executed failed, con[id="
-                                        + command.getConn_id()+", user=" +command.getConn_user()+", pwd="+command.getConn_pswd()+"].");
-                                continue;
-                            } catch (InterruptedException e) {
-                                e.printStackTrace();
+                    String sqlCmd = command.getCommand()
+                            .replaceAll(COMMON.RESOURCE_LOCAL_PATH_FLAG,COMMON.RESOURCE_LOCAL_PATH)
+                            .replaceAll(COMMON.RESOURCE_PATH_FLAG,COMMON.RESOURCE_PATH);
+                    boolean handledSource = handleSourceCommand(connection, command, sqlCmd);
+                    ResultSet resultSet = null;
+
+                    if(!handledSource){
+                        statement = connection.createStatement();
+                        if(command.isNeedWait()){
+                            execWaitOperation(command);
+                        }
+                        statement.execute(sqlCmd);
+                        if(command.isNeedWait()){
+                            Thread.sleep(COMMON.WAIT_TIMEOUT/10);
+                            if(waitThread != null && waitThread.isAlive()){
+                                try {
+                                    LOG.error(String.format("Command[%s][row:%d] has been executed before connection[id=%d] commit.\nBut still need to wait for connection[id=%d] being committed",
+                                            command.getCommand(),command.getPosition(),command.getWaitConnId(),command.getWaitConnId()));
+                                    waitThread.join();
+                                    script.addFailedCmd(command);
+                                    command.getTestResult().setErrorCode(RESULT.ERROR_CHECK_FAILED_CODE);
+                                    command.getTestResult().setErrorDesc(RESULT.ERROR_CHECK_FAILED_DESC);
+                                    command.getTestResult().setResult(RESULT.RESULT_TYPE_FAILED);
+                                    LOG.error("[" + script.getFileName() + "][row:" + command.getPosition() + "][" + command.getCommand().trim() + "] was executed failed, con[id="
+                                            + command.getConn_id()+", user=" +command.getConn_user()+", pwd="+command.getConn_pswd()+"].");
+                                    continue;
+                                } catch (InterruptedException e) {
+                                    e.printStackTrace();
+                                }
                             }
                         }
+                        resultSet = statement.getResultSet();
                     }
-                    ResultSet resultSet = statement.getResultSet();
+
                     if(resultSet != null){
                         RSSet rsSet = new RSSet(resultSet,command);
                         StmtResult actResult = new StmtResult(rsSet);
@@ -436,8 +460,11 @@ public class Executor {
                         if(j < commands.size() -1)
                             rs_writer.newLine();
                     }
-                    statement.close();
+                    closeStatementQuietly(statement);
+                    statement = null;
                 }catch (SQLException e) {
+                    closeStatementQuietly(statement);
+                    statement = null;
                     if(null == command){
                         break;
                     }
@@ -462,6 +489,8 @@ public class Executor {
                     if(j < commands.size() -1)
                         rs_writer.newLine();
                 } catch (InterruptedException e) {
+                    closeStatementQuietly(statement);
+                    statement = null;
                     throw new RuntimeException(e);
                 }
             }
@@ -524,10 +553,19 @@ public class Executor {
             }
 
             try {
-                statement = connection.createStatement();
-                String sqlCmd = command.getCommand().replaceAll(COMMON.RESOURCE_PATH_FLAG,COMMON.RESOURCE_PATH);
-                statement.execute(sqlCmd);
-                ResultSet resultSet = statement.getResultSet();
+                statement = null;
+                String sqlCmd = command.getCommand()
+                        .replaceAll(COMMON.RESOURCE_LOCAL_PATH_FLAG,COMMON.RESOURCE_LOCAL_PATH)
+                        .replaceAll(COMMON.RESOURCE_PATH_FLAG,COMMON.RESOURCE_PATH);
+                boolean handledSource = handleSourceCommand(connection, command, sqlCmd);
+                ResultSet resultSet = null;
+
+                if(!handledSource){
+                    statement = connection.createStatement();
+                    statement.execute(sqlCmd);
+                    resultSet = statement.getResultSet();
+                }
+
                 if (resultSet != null) {
                     RSSet rsSet = new RSSet(resultSet,command);
                     StmtResult actResult = new StmtResult(rsSet);
@@ -555,9 +593,12 @@ public class Executor {
                     LOG.info("[" + script.getFileName() + "][row:" + command.getPosition() + "][" + command.getCommand().trim() + "] need to be updated.");
                     needUpdate = true;
                 }
-                statement.close();
+                closeStatementQuietly(statement);
+                statement = null;
             } catch (SQLException e) {
                 try {
+                    closeStatementQuietly(statement);
+                    statement = null;
                     if (connection.isClosed() || !connection.isValid(10)) {
                         LOG.error("The connection has been lost,please check the logs .");
                         script.addAbnoramlCmd(command);
@@ -586,9 +627,11 @@ public class Executor {
                         needUpdate = true;
                     }
 
-                    assert statement != null;
-                    statement.close();
+                    closeStatementQuietly(statement);
+                    statement = null;
                 } catch (SQLException ex) {
+                    closeStatementQuietly(statement);
+                    statement = null;
                     throw new RuntimeException(ex);
                 }
             }
@@ -678,6 +721,188 @@ public class Executor {
 
     public static  void dropTestDB(Connection connection,TestScript script){
         dropTestDB(connection,script.getUseDB());
+    }
+
+    private static boolean handleSourceCommand(Connection connection, SqlCommand command, String sqlCmd) throws SQLException {
+        if (!isSourceCommand(sqlCmd)) {
+            return false;
+        }
+        Path sourcePath = resolveSourcePath(command, sqlCmd);
+        List<String> statements = loadSourceStatements(sourcePath);
+        if (statements.isEmpty()) {
+            LOG.debug(String.format("Source file[%s] referenced by command[%s][row:%d] is empty.", sourcePath, command.getScriptFile(), command.getPosition()));
+        }
+        for (String stmt : statements) {
+            String normalized = stmt
+                    .replaceAll(COMMON.RESOURCE_LOCAL_PATH_FLAG, COMMON.RESOURCE_LOCAL_PATH)
+                    .replaceAll(COMMON.RESOURCE_PATH_FLAG, COMMON.RESOURCE_PATH);
+            try (Statement inner = connection.createStatement()) {
+                boolean hasResult = inner.execute(normalized);
+                if (hasResult) {
+                    try (ResultSet rs = inner.getResultSet()) {
+                        if (rs != null) {
+                            while (rs.next()) {
+                                // consume existing rows so that subsequent commands can proceed
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        StmtResult actResult = new StmtResult();
+        actResult.setType(RESULT.STMT_RESULT_TYPE_NONE);
+        command.setActResult(actResult);
+        command.getTestResult().setActResult(actResult.toString());
+        LOG.debug(String.format("Executed source file[%s] for command[%s][row:%d].", sourcePath, command.getScriptFile(), command.getPosition()));
+        return true;
+    }
+
+    private static boolean isSourceCommand(String sqlCmd) {
+        if (sqlCmd == null) {
+            return false;
+        }
+        return sqlCmd.trim().toLowerCase(Locale.ROOT).startsWith("source ");
+    }
+
+    private static Path resolveSourcePath(SqlCommand command, String sqlCmd) throws SQLException {
+        String filePath = extractSourceFilePath(sqlCmd);
+        if (filePath == null || filePath.isEmpty()) {
+            throw new SQLException(String.format("Invalid source command in file[%s] at row %d.", command.getScriptFile(), command.getPosition()));
+        }
+        try {
+            Path path = Paths.get(filePath);
+            if (!path.isAbsolute()) {
+                String scriptFile = command.getScriptFile();
+                if (scriptFile != null) {
+                    Path baseDir = Paths.get(scriptFile).toAbsolutePath().getParent();
+                    if (baseDir != null) {
+                        path = baseDir.resolve(filePath).normalize();
+                    }
+                } else {
+                    path = path.toAbsolutePath().normalize();
+                }
+            } else {
+                path = path.normalize();
+            }
+            if (!Files.exists(path)) {
+                throw new SQLException(String.format("Source file does not exist: %s", path));
+            }
+            return path;
+        } catch (RuntimeException ex) {
+            throw new SQLException(String.format("Invalid source file path for command[%s][row:%d]: %s", command.getScriptFile(), command.getPosition(), ex.getMessage()), ex);
+        }
+    }
+
+    private static String extractSourceFilePath(String sqlCmd) {
+        String trimmed = sqlCmd.trim();
+        if (trimmed.endsWith(";")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
+        }
+        if (!trimmed.toLowerCase(Locale.ROOT).startsWith("source ")) {
+            return null;
+        }
+        String path = trimmed.substring("source".length()).trim();
+        if (path.startsWith("'") && path.endsWith("'") && path.length() >= 2) {
+            path = path.substring(1, path.length() - 1);
+        } else if (path.startsWith("\"") && path.endsWith("\"") && path.length() >= 2) {
+            path = path.substring(1, path.length() - 1);
+        } else if (path.startsWith("`") && path.endsWith("`") && path.length() >= 2) {
+            path = path.substring(1, path.length() - 1);
+        }
+        return path.trim();
+    }
+
+    private static List<String> loadSourceStatements(Path path) throws SQLException {
+        try {
+            String content = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
+            return splitStatements(content);
+        } catch (IOException e) {
+            throw new SQLException(String.format("Failed to read source file[%s]: %s", path, e.getMessage()), e);
+        }
+    }
+
+    private static List<String> splitStatements(String content) {
+        List<String> statements = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inSingle = false;
+        boolean inDouble = false;
+        boolean inLineComment = false;
+        boolean inBlockComment = false;
+
+        for (int i = 0; i < content.length(); i++) {
+            char ch = content.charAt(i);
+            char next = i + 1 < content.length() ? content.charAt(i + 1) : '\0';
+
+            if (inLineComment) {
+                if (ch == '\n') {
+                    inLineComment = false;
+                }
+                continue;
+            }
+            if (inBlockComment) {
+                if (ch == '*' && next == '/') {
+                    inBlockComment = false;
+                    i++;
+                }
+                continue;
+            }
+
+            if (!inSingle && !inDouble) {
+                if (ch == '-' && next == '-') {
+                    inLineComment = true;
+                    i++;
+                    continue;
+                }
+                if (ch == '#') {
+                    inLineComment = true;
+                    continue;
+                }
+                if (ch == '/' && next == '*') {
+                    inBlockComment = true;
+                    i++;
+                    continue;
+                }
+            }
+
+            if (ch == '\'' && !inDouble) {
+                boolean escaped = i > 0 && content.charAt(i - 1) == '\\';
+                if (!escaped) {
+                    inSingle = !inSingle;
+                }
+            } else if (ch == '"' && !inSingle) {
+                boolean escaped = i > 0 && content.charAt(i - 1) == '\\';
+                if (!escaped) {
+                    inDouble = !inDouble;
+                }
+            }
+
+            if (ch == ';' && !inSingle && !inDouble) {
+                String stmt = current.toString().trim();
+                if (!stmt.isEmpty()) {
+                    statements.add(stmt);
+                }
+                current.setLength(0);
+            } else {
+                current.append(ch);
+            }
+        }
+
+        String trailing = current.toString().trim();
+        if (!trailing.isEmpty()) {
+            statements.add(trailing);
+        }
+        return statements;
+    }
+
+    private static void closeStatementQuietly(Statement stmt) {
+        if (stmt == null) {
+            return;
+        }
+        try {
+            stmt.close();
+        } catch (SQLException ex) {
+            LOG.debug(String.format("Ignore failure when closing statement: %s", ex.getMessage()));
+        }
     }
 
     public static void syncCommit() {
